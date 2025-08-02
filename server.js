@@ -3,7 +3,7 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-const WEBHOOK = "https://itnasr.bitrix24.kz/rest/1/bucjza1li2wbp6lr/";
+const WEBHOOK = "https://itnasr.bitrix24.kz/rest/1/ryf2hig29n6p3f1w/";
 const RUBLE_FIELD = "UF_CRM_1753277551304"; // Сумма в рублях
 
 app.get("/", (req, res) => {
