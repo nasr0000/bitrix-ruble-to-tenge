@@ -13,25 +13,10 @@ function toNum(s) {
   return parseFloat(String(s).replace(/\s/g, "").replace(",", "."));
 }
 
-async function withRetry(fn, tries = 2, delayMs = 400) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      lastErr = e;
-      if (i < tries - 1) await new Promise(r => setTimeout(r, delayMs));
-    }
-  }
-  throw lastErr;
-}
-
-// ===== MiG parser (RUB → KZT, Покупка) =====
+// ===== MiG parser (RUB → KZT, ПРОДАЖА) =====
 async function getRubRateFromMig() {
   const url = "https://mig.kz/api/v1/gadget/html";
-  const { data: html } = await axios.get(url, { timeout: 10000, headers: {
-    "User-Agent": "Mozilla/5.0 (RateFetcher/1.0)"
-  }});
+  const { data: html } = await axios.get(url, { timeout: 10000 });
 
   const text = String(html)
     .replace(/&nbsp;/gi, " ")
@@ -41,46 +26,22 @@ async function getRubRateFromMig() {
     .replace(/\s+/g, " ")
     .trim();
 
-  // Берём всё, что идёт ПОСЛЕ первого "RUB"
-  const parts = text.split("RUB");
-  const rubBlock = parts.length > 1 ? parts.slice(1).join("RUB") : "";
+  // Берём всё после RUB
+  const rubBlock = text.split("RUB")[1];
   if (!rubBlock) throw new Error("RUB not found in MiG");
 
-  // Варианты подписи "Покупка"
-  const buyPatterns = [
-    /Покупка[^0-9]{0,30}([\d\s.,]+)/i,     // ru
-    /Сатып алу[^0-9]{0,30}([\d\s.,]+)/i,   // kk
-    /Buy[^0-9]{0,30}([\d\s.,]+)/i          // en
-  ];
-
-  // 1) Пытаемся найти в rubBlock
-  for (const rx of buyPatterns) {
-    const m = rubBlock.match(rx);
-    if (m && m[1]) {
-      const val = toNum(m[1]);
-      if (!isNaN(val) && val > 0) return val;
-    }
+  // Ищем два подряд числа (продажа и покупка)
+  const match = rubBlock.match(/([\d.,]+)\s+([\d.,]+)/);
+  if (!match) {
+    console.warn("MiG rubBlock:", rubBlock.slice(0, 200));
+    throw new Error("RUB rates not found");
   }
 
-  // 2) Фолбэк: по всему тексту “RUB … Покупка … число”
-  for (const rx of buyPatterns) {
-    const m = text.match(new RegExp(`RUB[^P]{0,120}${rx.source}`, "i"));
-    if (m && m[1]) {
-      const val = toNum(m[1]);
-      if (!isNaN(val) && val > 0) return val;
-    }
-  }
+  const sell = toNum(match[1]); // ПРОДАЖА (верхнее значение)
+  const buy = toNum(match[2]);  // ПОКУПКА (нижнее значение)
 
-  // 3) Альтернативный порядок: "Продажа ... Покупка ..."
-  const alt = rubBlock.match(/Продажа[^0-9]{0,30}([\d\s.,]+)[^R]*Покупка[^0-9]{0,30}([\d\s.,]+)/i);
-  if (alt && alt[2]) {
-    const val = toNum(alt[2]);
-    if (!isNaN(val) && val > 0) return val;
-  }
-
-  // Для диагностики выведем кусок текста (не весь)
-  console.warn("MiG parse warn. rubBlock:", rubBlock.slice(0, 400));
-  throw new Error("RUB buy rate not found");
+  if (!sell) throw new Error("RUB sell rate not found");
+  return sell; // возвращаем ПРОДАЖУ
 }
 
 app.get("/", (req, res) => {
@@ -91,11 +52,11 @@ app.get("/ping", (req, res) => {
   res.send("✅ Сервер отвечает! Время: " + new Date().toISOString());
 });
 
-// Удобный дебаг-эндпоинт, чтобы смотреть текущий курс с MiG
+// для теста курса напрямую
 app.get("/rate", async (_req, res) => {
   try {
-    const rate = await withRetry(getRubRateFromMig, 2);
-    res.json({ source: "MiG", rub_kzt_buy: rate });
+    const rate = await getRubRateFromMig();
+    res.json({ source: "MiG", rub_kzt_sell: rate });
   } catch (err) {
     const msg = err?.response?.data || err.message || String(err);
     res.status(500).json({ error: msg });
@@ -116,8 +77,8 @@ app.post("/", async (req, res) => {
     const rub = toNum(rubRaw);
     if (isNaN(rub)) return res.status(200).send("❌ Некорректное значение рубля");
 
-    // Курс RUB→KZT (покупка)
-    const rate = await withRetry(getRubRateFromMig, 2);
+    // Курс RUB→KZT (ПРОДАЖА)
+    const rate = await getRubRateFromMig();
     if (!rate) return res.status(500).send("❌ Курс не получен с MiG");
 
     const tenge = Math.round(rub * rate);
