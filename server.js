@@ -1,23 +1,39 @@
-// ruble-to-tenge-mig.js
+// ruble-to-tenge-mig.js (optimized, deal-only)
 const express = require("express");
 const axios = require("axios");
+
 const app = express();
 app.use(express.json());
 
 const WEBHOOK = "https://itnasr.bitrix24.kz/rest/1/ryf2hig29n6p3f1w/";
-const RUBLE_FIELD = "UF_CRM_1753277551304"; // поле "Сумма в рублях"
+const AMOUNT_FIELD = "UF_CRM_1753277551304"; // одно поле: "Сумма в валюте" (используем как RUB в этом проекте)
+
+const http = axios.create({
+  timeout: 8000,
+  headers: { "User-Agent": "itnasr-b24-rub2kzt" },
+});
 
 // ===== Helpers =====
-function toNum(s) {
-  if (!s) return NaN;
-  return parseFloat(String(s).replace(/\s/g, "").replace(",", "."));
+function toNum(val) {
+  if (val == null) return NaN;
+  return parseFloat(String(val).replace(/\s/g, "").replace(",", "."));
 }
 
-// ===== MiG parser (RUB → KZT, ПРОДАЖА) =====
-async function getRubRateFromMig() {
-  const url = "https://mig.kz/api/v1/gadget/html";
-  const { data: html } = await axios.get(url, { timeout: 10000 });
+function parseMoney(val) {
+  if (val == null) return NaN;
+  const n = parseFloat(String(val).replace(/[^0-9.,]/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : NaN;
+}
 
+/* ---- MiG: SELL RUB→KZT с кэшем ---- */
+let migCache = { sell: null, ts: 0 };
+const MIG_TTL_MS = 120 * 1000;
+
+async function getRubSellFromMig() {
+  const now = Date.now();
+  if (migCache.sell && now - migCache.ts < MIG_TTL_MS) return migCache.sell;
+
+  const { data: html } = await http.get("https://mig.kz/api/v1/gadget/html");
   const text = String(html)
     .replace(/&nbsp;/gi, " ")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -26,101 +42,84 @@ async function getRubRateFromMig() {
     .replace(/\s+/g, " ")
     .trim();
 
-  // Берём всё после RUB
-  const rubBlock = text.split("RUB")[1];
-  if (!rubBlock) throw new Error("RUB not found in MiG");
+  // Пробуем найти два числа рядом с RUB
+  // В зависимости от разметки могут быть варианты
+  let m =
+    text.match(/RUB\s*(\d{1,3}(?:[.,]\d{1,4})?)\s*(\d{1,3}(?:[.,]\d{1,4})?)/i) ||
+    text.match(/(\d{1,3}(?:[.,]\d{1,4})?)\s*RUB\s*(\d{1,3}(?:[.,]\d{1,4})?)/i);
 
-  // Ищем два подряд числа (продажа и покупка)
-  const match = rubBlock.match(/([\d.,]+)\s+([\d.,]+)/);
-  if (!match) {
-    console.warn("MiG rubBlock:", rubBlock.slice(0, 200));
-    throw new Error("RUB rates not found");
+  if (!m) throw new Error("MiG: RUB not found");
+
+  const a = toNum(m[1]);
+  const b = toNum(m[2]);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) throw new Error(`MiG: invalid RUB values a=${a} b=${b}`);
+
+  // Обычно sell >= buy, берём большее как sell
+  const sell = Math.max(a, b);
+  const buy = Math.min(a, b);
+
+  // Валидация (рубль обычно ~3-10 тг)
+  if (!Number.isFinite(sell) || sell < 1 || sell > 50 || buy > sell) {
+    throw new Error(`MiG: invalid RUB rates buy=${buy} sell=${sell}`);
   }
 
-  const sell = toNum(match[1]); // ПРОДАЖА (верхнее значение)
-  const buy = toNum(match[2]);  // ПОКУПКА (нижнее значение)
-
-  if (!sell) throw new Error("RUB sell rate not found");
-  return sell; // возвращаем ПРОДАЖУ
+  migCache = { sell, ts: now };
+  return sell;
 }
 
-app.get("/", (req, res) => {
-  res.send("🚀 Сервер работает! Ожидаю POST от Bitrix24...");
-});
-
-app.get("/ping", (req, res) => {
-  res.send("✅ Сервер отвечает! Время: " + new Date().toISOString());
-});
-
-// для теста курса напрямую
+// ===== Health endpoints =====
+app.get("/", (_req, res) => res.send("🚀 RUB→KZT сервер работает. Ожидаю POST от Bitrix24..."));
+app.get("/ping", (_req, res) => res.send("✅ OK " + new Date().toISOString()));
 app.get("/rate", async (_req, res) => {
   try {
-    const rate = await getRubRateFromMig();
-    res.json({ source: "MiG", rub_kzt_sell: rate });
-  } catch (err) {
-    const msg = err?.response?.data || err.message || String(err);
-    res.status(500).json({ error: msg });
+    const sell = await getRubSellFromMig();
+    res.json({ source: "MiG", rub_kzt_sell: sell, cache_age_ms: Date.now() - migCache.ts });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
+// ===== Webhook =====
 app.post("/", async (req, res) => {
   const dealId = req.body?.data?.FIELDS?.ID;
-  if (!dealId) return res.status(400).send("❌ Не передан ID сделки");
+  if (!dealId) return res.status(400).send("No deal ID");
 
   try {
-    // Получаем сделку
-    const getRes = await axios.post(`${WEBHOOK}crm.deal.get`, { id: dealId });
-    const deal = getRes.data?.result;
-    const rubRaw = deal?.[RUBLE_FIELD];
-    if (!rubRaw) return res.status(200).send("⚠️ Поле с рублями пустое");
+    // 1) Быстро: пробуем взять сумму из webhook
+    let raw = req.body?.data?.FIELDS?.[AMOUNT_FIELD];
+    let rub = parseMoney(raw);
 
-    const rub = toNum(rubRaw);
-    if (isNaN(rub)) return res.status(200).send("❌ Некорректное значение рубля");
+    // 2) Fallback: если не пришло — берём из сделки
+    let dealFromGet = null;
+    if (!Number.isFinite(rub)) {
+      const dealResp = await http.post(`${WEBHOOK}crm.deal.get`, { id: dealId });
+      dealFromGet = dealResp.data?.result;
+      raw = dealFromGet?.[AMOUNT_FIELD];
+      rub = parseMoney(raw);
+    }
 
-    // Курс RUB→KZT (ПРОДАЖА)
-    const rate = await getRubRateFromMig();
-    if (!rate) return res.status(500).send("❌ Курс не получен с MiG");
+    if (!Number.isFinite(rub)) return res.status(200).send("Ruble amount is empty or invalid");
 
-    const tenge = Math.round(rub * rate);
+    // 3) Курс и расчёт
+    const sell = await getRubSellFromMig();
+    const tenge = Math.round(rub * sell);
 
-    // Обновляем сумму сделки
-    await axios.post(`${WEBHOOK}crm.deal.update`, {
+    // 4) Не обновляем лишний раз (только если уже делали get)
+    if (dealFromGet && String(dealFromGet?.OPPORTUNITY) === String(tenge) && dealFromGet?.CURRENCY_ID === "KZT") {
+      return res.send(`SKIP: already ${tenge} ₸ (rate ${sell})`);
+    }
+
+    // 5) Обновляем только сделку
+    await http.post(`${WEBHOOK}crm.deal.update`, {
       id: dealId,
       fields: { OPPORTUNITY: tenge, CURRENCY_ID: "KZT" },
     });
 
-    console.log(`✅ Сделка #${dealId}: ₽${rub} × ${rate} = ${tenge} ₸`);
-
-    // Обновляем товары
-    const productRes = await axios.post(`${WEBHOOK}crm.deal.productrows.get`, { id: dealId });
-    const productRows = productRes.data?.result;
-
-    if (Array.isArray(productRows) && productRows.length > 0) {
-      const updatedRows = productRows.map((row) => ({
-        ...row,
-        PRICE: tenge,
-        PRICE_BRUTTO: tenge,
-        PRICE_NETTO: tenge,
-        CURRENCY_ID: "KZT",
-      }));
-
-      await axios.post(`${WEBHOOK}crm.deal.productrows.set`, {
-        id: dealId,
-        rows: updatedRows,
-      });
-
-      console.log(`🛒 Обновлены цены товаров в сделке #${dealId} → ${tenge} ₸`);
-    } else {
-      console.warn(`⚠️ В сделке #${dealId} нет товаров для обновления`);
-    }
-
-    res.send(`✅ Обновлено: ₽${rub} × ${rate} = ${tenge} ₸`);
-  } catch (err) {
-    const msg = err?.response?.data || err.message || String(err);
-    console.error("❌ Ошибка:", msg);
-    res.status(500).send("❌ Ошибка сервера: " + (typeof msg === "string" ? msg : JSON.stringify(msg)));
+    res.send(`OK: ₽${rub} × ${sell} = ${tenge} ₸`);
+  } catch (e) {
+    res.status(500).send("Server error: " + (e?.message || e));
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("🚀 Сервер запущен на порту", PORT));
+app.listen(PORT, () => console.log("🚀 Server started on", PORT));
