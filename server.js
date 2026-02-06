@@ -104,7 +104,7 @@ app.post("/", async (req, res) => {
       fields: { 
         OPPORTUNITY: tenge, 
         CURRENCY_ID: "KZT",
-        COMMENTS: `Курс RUB/KZT: ${effectiveRate.toFixed(2)} (MiG: ${rawRate} + 3% коммисия сервиса). Обновлено: ${new Date().toLocaleTimeString()}`
+        COMMENTS: `курс конвертации: ${effectiveRate.toFixed(2)} (MiG: ${rawRate} + 3% комиссия сервиса)`
       },
     });
 
